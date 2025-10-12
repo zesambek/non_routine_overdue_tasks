@@ -599,7 +599,7 @@ def extract_open_tasks(driver: webdriver.Remote) -> pd.DataFrame:
       • If the two-row parse yields nothing, fall back to header=0.
     We DO NOT fabricate new data or extra columns; we only flatten/rename.
     """
-    table = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.ID, "idTableOpenTasks")))
+    table = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.ID, "idTableOpenFaultsCol_0_")))
     html = table.get_attribute("outerHTML") or ""
 
     # ---- Preferred path: two-row header (MultiIndex) -------------------------
