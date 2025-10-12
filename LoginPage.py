@@ -554,21 +554,21 @@ def go_to_open_tasks(driver: webdriver.Remote, aircraft_reg: str) -> None:
         )
     )
 
-    open_tab = WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.ID, "Open_link")))
+    open_tab = WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.ID, "OpenFaults_link")))
     try:
         open_tab.click()
     except Exception:
         driver.execute_script("arguments[0].click();", open_tab)
 
-    WebDriverWait(driver, 50).until(EC.text_to_be_present_in_element((By.ID, "OpenTasks_link"), "Open Tasks"))
-    ot = driver.find_element(By.ID, "OpenTasks_link")
+    WebDriverWait(driver, 50).until(EC.text_to_be_present_in_element((By.ID, "idTableOpenFaults"), "Open Faults"))
+    ot = driver.find_element(By.ID, "idTableOpenFaults")
     try:
         ot.click()
     except Exception:
         driver.execute_script("arguments[0].click();", ot)
 
     # Wait for any cell in the table grid
-    WebDriverWait(driver, 50).until(EC.presence_of_element_located((By.ID, "idTableOpenTasksCol_0_")))
+    WebDriverWait(driver, 50).until(EC.presence_of_element_located((By.ID, "idTableOpenFaultsCol_0_")))
 
 
 # ========================= Extraction & Enrichment =========================
