@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from io import StringIO
+from typing import Iterable, Tuple
 
 import pandas as pd
 from selenium import webdriver
@@ -13,6 +14,36 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from overduetasks.config import Credentials
 from overduetasks.exceptions import LoginError, OpenTasksError
+
+
+_OPEN_TASK_HEADER_OVERRIDES: dict[Tuple[str, str], str] = {
+    ("Task Name", "Name"): "Task Name",
+    ("Task Name", "ID"): "Task ID",
+    ("Fault Name", "Name"): "Fault Name",
+    ("Fault Name", "ID"): "Fault ID",
+    ("Driving Task", "Name"): "Driving Task Name",
+    ("Driving Task", "ID"): "Driving Task ID",
+    ("Work Package", "Name"): "Work Package Name",
+    ("Work Package", "ID"): "Work Package ID",
+    ("Work Package No", "Work Package No"): "Work Package No",
+    ("Config Position", "Config Position"): "Config Position",
+    ("Must Be Removed", "Must Be Removed"): "Must Be Removed",
+    ("Due", "Due"): "Due",
+    ("Next Shop Visit", "Next Shop Visit"): "Next Shop Visit",
+    ("Inventory", "Inventory"): "Inventory",
+    ("Found on Date", "Found on Date"): "Found on Date",
+    ("Found On Flight", "Found On Flight"): "Found On Flight",
+    ("Severity", "Severity"): "Severity",
+    ("Status", "Status"): "Status",
+    ("Failure Type", "Failure Type"): "Failure Type",
+    ("Fault Priority", "Fault Priority"): "Fault Priority",
+    ("Deferral Class", "Deferral Class"): "Deferral Class",
+    ("Deferral Reference", "Deferral Reference"): "Deferral Reference",
+    ("Work Type(s)", "Work Type(s)"): "Work Type(s)",
+    ("Operational Restrictions", "Operational Restrictions"): "Operational Restrictions",
+    ("ETOPS Significant", "ETOPS Significant"): "ETOPS Significant",
+    ("Material Availability", "Material Availability"): "Material Availability",
+}
 
 
 def wait_dom_ready(driver: webdriver.Remote, timeout: int = 30) -> None:
@@ -94,124 +125,18 @@ def go_to_open_tasks(driver: webdriver.Remote, aircraft_reg: str) -> None:
 
 
 def extract_open_tasks(driver: webdriver.Remote) -> pd.DataFrame:
-    """Extract the open tasks table into a DataFrame with flattened headers."""
+    """Extract and normalize the Open Faults grid into a tidy DataFrame."""
     table = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.ID, "idTableOpenFaults")))
-    html = table.get_attribute("outerHTML") or ""
+    html = (table.get_attribute("outerHTML") or "").strip()
 
-    try:
-        dfs = pd.read_html(
-            StringIO(html),
-            match=".+",
-            header=[0, 1],
-            index_col=None,
-            skiprows=None,
-            attrs=None,
-            parse_dates=False,
-            thousands=",",
-            encoding=None,
-            decimal=".",
-            converters=None,
-            na_values=None,
-            keep_default_na=True,
-            displayed_only=True,
-            extract_links=None,
-        )
-        if dfs and not dfs[0].empty:
-            df = dfs[0]
+    if not html:
+        raise OpenTasksError("Open faults table did not return any HTML.")
 
-            if hasattr(df.columns, "levels") and len(df.columns.levels) == 2:
-                explicit_map = {
-                    ("Task Name", "Name"): "Task Name",
-                    ("Task Name", "ID"): "Task ID",
-                    ("Fault Name", "Name"): "Fault Name",
-                    ("Fault Name", "ID"): "Fault ID",
-                    ("Driving Task", "Name"): "Driving Task Name",
-                    ("Driving Task", "ID"): "Driving Task ID",
-                    ("Work Package", "Name"): "Work Package Name",
-                    ("Work Package", "ID"): "Work Package ID",
-                    ("Work Package No", "Work Package No"): "Work Package No",
-                    ("Config Position", "Config Position"): "Config Position",
-                    ("Must Be Removed", "Must Be Removed"): "Must Be Removed",
-                    ("Due", "Due"): "Due",
-                    ("Next Shop Visit", "Next Shop Visit"): "Next Shop Visit",
-                    ("Inventory", "Inventory"): "Inventory",
-                    ("Found on Date", "Found on Date"): "Found on Date",
-                    ("Found On Flight", "Found On Flight"): "Found On Flight",
-                    ("Severity", "Severity"): "Severity",
-                    ("Status", "Status"): "Status",
-                    ("Failure Type", "Failure Type"): "Failure Type",
-                    ("Fault Priority", "Fault Priority"): "Fault Priority",
-                    ("Deferral Class", "Deferral Class"): "Deferral Class",
-                    ("Deferral Reference", "Deferral Reference"): "Deferral Reference",
-                    ("Work Type(s)", "Work Type(s)"): "Work Type(s)",
-                    ("Operational Restrictions", "Operational Restrictions"): "Operational Restrictions",
-                    ("ETOPS Significant", "ETOPS Significant"): "ETOPS Significant",
-                    ("Material Availability", "Material Availability"): "Material Availability",
-                }
+    df = _read_open_tasks_table(html)
+    if df.empty:
+        return df
 
-                new_cols: list[str] = []
-                keep_mask: list[bool] = []
-
-                for top, sub in df.columns:
-                    a = str(top).strip()
-                    b = str(sub).strip()
-
-                    if a.startswith("Unnamed: 0_level_0") and b.startswith("Unnamed: 0_level_1"):
-                        keep_mask.append(False)
-                        new_cols.append("")
-                        continue
-
-                    key = (a, b)
-                    if key in explicit_map:
-                        keep_mask.append(True)
-                        new_cols.append(explicit_map[key])
-                    else:
-                        if a == b:
-                            keep_mask.append(True)
-                            new_cols.append(a)
-                        elif b in ("", "nan", "None"):
-                            keep_mask.append(True)
-                            new_cols.append(a)
-                        else:
-                            keep_mask.append(True)
-                            new_cols.append(f"{a} {b}")
-
-                df = df.loc[:, keep_mask]
-                df.columns = new_cols
-
-                seen = {}
-                uniq = []
-                for name in df.columns:
-                    if name not in seen:
-                        seen[name] = 1
-                        uniq.append(name)
-                    else:
-                        seen[name] += 1
-                        uniq.append(f"{name}.{seen[name]}")
-                df.columns = uniq
-
-            return df
-    except Exception:
-        pass
-
-    dfs = pd.read_html(
-        StringIO(html),
-        match=".+",
-        header=0,
-        index_col=None,
-        skiprows=None,
-        attrs=None,
-        parse_dates=False,
-        thousands=",",
-        encoding=None,
-        decimal=".",
-        converters=None,
-        na_values=None,
-        keep_default_na=True,
-        displayed_only=True,
-        extract_links=None,
-    )
-    return dfs[0] if dfs else pd.DataFrame()
+    return _normalize_open_tasks_frame(df)
 
 
 def _visible(driver: webdriver.Remote, by: By, value: str) -> bool:
@@ -220,3 +145,111 @@ def _visible(driver: webdriver.Remote, by: By, value: str) -> bool:
         return any(el.is_displayed() for el in driver.find_elements(by, value))
     except Exception:
         return False
+
+
+def _read_open_tasks_table(html: str) -> pd.DataFrame:
+    """Parse the Open Faults table HTML using pandas with sensible fallbacks."""
+    parsing_strategies = ([0, 1], 0)
+
+    for header in parsing_strategies:
+        try:
+            frames = pd.read_html(
+                StringIO(html),
+                header=header,
+                index_col=None,
+                keep_default_na=True,
+                thousands=",",
+                decimal=".",
+                displayed_only=True,
+            )
+        except ValueError:
+            continue
+
+        if frames:
+            return frames[0]
+
+    return pd.DataFrame()
+
+
+def _normalize_open_tasks_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten column headers and drop unusable columns."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df = _flatten_multiindex_columns(df)
+    else:
+        df = _normalize_single_level_columns(df)
+
+    return df.reset_index(drop=True)
+
+
+def _flatten_multiindex_columns(df: pd.DataFrame) -> pd.DataFrame:
+    keepers: list[tuple[Tuple[str, ...], str]] = []
+
+    for column in df.columns:
+        raw = tuple("" if part is None else str(part).strip() for part in column)
+        override = _OPEN_TASK_HEADER_OVERRIDES.get(raw)
+
+        if override:
+            keepers.append((column, override))
+            continue
+
+        cleaned = [_clean_header_text(label) for label in raw]
+        cleaned = [label for label in cleaned if label]
+
+        if not cleaned:
+            continue
+
+        # Drop duplicated words within the same column name while preserving order.
+        deduped_seen: set[str] = set()
+        ordered: list[str] = []
+        for label in cleaned:
+            if label in deduped_seen:
+                continue
+            deduped_seen.add(label)
+            ordered.append(label)
+        deduped_name = " ".join(ordered)
+        keepers.append((column, deduped_name))
+
+    if not keepers:
+        return df.iloc[:, 0:0]
+
+    columns, names = zip(*keepers)
+    normalized = df.loc[:, list(columns)]
+    normalized.columns = _dedupe(names)
+    return normalized
+
+
+def _normalize_single_level_columns(df: pd.DataFrame) -> pd.DataFrame:
+    keepers: list[tuple[str, str]] = []
+
+    for column in df.columns:
+        label = _clean_header_text("" if column is None else str(column).strip())
+        if not label:
+            continue
+        keepers.append((column, label))
+
+    if not keepers:
+        return df.iloc[:, 0:0]
+
+    columns, names = zip(*keepers)
+    normalized = df.loc[:, list(columns)]
+    normalized.columns = _dedupe(names)
+    return normalized
+
+
+def _clean_header_text(value: str) -> str:
+    text = value.strip()
+    if not text or text.lower() in {"nan", "none"} or text.lower().startswith("unnamed"):
+        return ""
+    return text
+
+
+def _dedupe(names: Iterable[str]) -> list[str]:
+    seen: dict[str, int] = {}
+    resolved: list[str] = []
+
+    for name in names:
+        count = seen.get(name, 0) + 1
+        seen[name] = count
+        resolved.append(name if count == 1 else f"{name}.{count}")
+
+    return resolved
