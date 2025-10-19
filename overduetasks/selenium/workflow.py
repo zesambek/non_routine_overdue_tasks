@@ -76,25 +76,26 @@ def go_to_open_tasks(driver: webdriver.Remote, aircraft_reg: str) -> None:
         )
     )
 
-    open_tab = WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.ID, "OpenFaults_link")))
+    open_tab = WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.ID, "Open_link")))
     try:
         open_tab.click()
     except Exception:
         driver.execute_script("arguments[0].click();", open_tab)
 
-    WebDriverWait(driver, 50).until(EC.text_to_be_present_in_element((By.ID, "idTableOpenFaults"), "Open Faults"))
-    open_faults = driver.find_element(By.ID, "idTableOpenFaults")
+    WebDriverWait(driver, 50).until(EC.text_to_be_present_in_element((By.ID, "OpenFaults_link"), "Open Faults"))
+    open_faults = driver.find_element(By.ID, "OpenFaults_link")
     try:
         open_faults.click()
     except Exception:
         driver.execute_script("arguments[0].click();", open_faults)
+        print("samson")
 
-    WebDriverWait(driver, 50).until(EC.presence_of_element_located((By.ID, "idTableOpenFaultsCol_0_")))
+    WebDriverWait(driver, 50).until(EC.presence_of_element_located((By.ID, "idButtonRaiseFault")))
 
 
 def extract_open_tasks(driver: webdriver.Remote) -> pd.DataFrame:
     """Extract the open tasks table into a DataFrame with flattened headers."""
-    table = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.ID, "idTableOpenFaultsCol_0_")))
+    table = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.ID, "idTableOpenFaults")))
     html = table.get_attribute("outerHTML") or ""
 
     try:
@@ -122,21 +123,30 @@ def extract_open_tasks(driver: webdriver.Remote) -> pd.DataFrame:
                 explicit_map = {
                     ("Task Name", "Name"): "Task Name",
                     ("Task Name", "ID"): "Task ID",
+                    ("Fault Name", "Name"): "Fault Name",
+                    ("Fault Name", "ID"): "Fault ID",
+                    ("Driving Task", "Name"): "Driving Task Name",
+                    ("Driving Task", "ID"): "Driving Task ID",
+                    ("Work Package", "Name"): "Work Package Name",
+                    ("Work Package", "ID"): "Work Package ID",
+                    ("Work Package No", "Work Package No"): "Work Package No",
                     ("Config Position", "Config Position"): "Config Position",
                     ("Must Be Removed", "Must Be Removed"): "Must Be Removed",
                     ("Due", "Due"): "Due",
                     ("Next Shop Visit", "Next Shop Visit"): "Next Shop Visit",
                     ("Inventory", "Inventory"): "Inventory",
-                    ("Task Status", "Task Status"): "Task Status",
-                    ("Task Type", "Task Type"): "Task Type",
+                    ("Found on Date", "Found on Date"): "Found on Date",
+                    ("Found On Flight", "Found On Flight"): "Found On Flight",
+                    ("Severity", "Severity"): "Severity",
+                    ("Status", "Status"): "Status",
+                    ("Failure Type", "Failure Type"): "Failure Type",
+                    ("Fault Priority", "Fault Priority"): "Fault Priority",
+                    ("Deferral Class", "Deferral Class"): "Deferral Class",
+                    ("Deferral Reference", "Deferral Reference"): "Deferral Reference",
                     ("Work Type(s)", "Work Type(s)"): "Work Type(s)",
-                    ("Originator", "Originator"): "Originator",
-                    ("Task Priority", "Task Priority"): "Task Priority",
-                    ("Schedule Priority", "Schedule Priority"): "Schedule Priority",
+                    ("Operational Restrictions", "Operational Restrictions"): "Operational Restrictions",
                     ("ETOPS Significant", "ETOPS Significant"): "ETOPS Significant",
-                    ("Work Package", "Name"): "Work Package Name",
-                    ("Work Package", "ID"): "Work Package ID",
-                    ("Work Package No", "Work Package No"): "Work Package No",
+                    ("Material Availability", "Material Availability"): "Material Availability",
                 }
 
                 new_cols: list[str] = []
