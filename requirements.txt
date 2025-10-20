@@ -1,0 +1,11 @@
+# Core data tooling
+pandas>=2.1
+numpy>=1.25
+streamlit>=1.30
+selenium>=4.13
+
+# Analytics and visualization stack
+matplotlib>=3.8
+seaborn>=0.13
+scipy>=1.11
+statsmodels>=0.14

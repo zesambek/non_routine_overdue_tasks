@@ -8,7 +8,7 @@ import streamlit as st
 
 from overduetasks import LoginError, OpenTasksError, SetupError
 from overduetasks.services import OpenTasksScraper
-from overduetasks.ui import collect_inputs_ui
+from overduetasks.ui import collect_inputs_ui, render_analysis_dashboard
 from shared_data import save_dataframe
 
 st.set_page_config(page_title="Maintenix → Open Tasks (Scraper)", page_icon="🛠️", layout="wide")
@@ -66,22 +66,29 @@ def run_app() -> None:
             return
 
         st.success(f"Fetched {len(result.dataframe)} rows.")
-        st.dataframe(result.dataframe.head(200), use_container_width=True, hide_index=True)
 
-        saved_path = save_dataframe(result.dataframe)
-        st.info(f"Saved to: {saved_path}")
+        raw_tab, analytics_tab = st.tabs(["Raw Data", "Analytics Dashboard"])
 
-        buf = BytesIO()
-        result.dataframe.to_excel(buf, index=False)
-        buf.seek(0)
-        st.download_button(
-            "⬇️ Download (Excel)",
-            buf.getvalue(),
-            file_name="open_tasks_latest.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="dl_excel",
-        )
+        with raw_tab:
+            st.dataframe(result.dataframe.head(200), use_container_width=True, hide_index=True)
+
+            saved_path = save_dataframe(result.dataframe)
+            st.info(f"Saved to: {saved_path}")
+
+            buf = BytesIO()
+            result.dataframe.to_excel(buf, index=False)
+            buf.seek(0)
+            st.download_button(
+                "⬇️ Download (Excel)",
+                buf.getvalue(),
+                file_name="open_tasks_latest.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="dl_excel",
+            )
+
+        with analytics_tab:
+            render_analysis_dashboard(result.dataframe)
 
         if result.errors:
             with st.expander("⚠️ Skipped registrations"):
