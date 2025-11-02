@@ -7,6 +7,7 @@ from collections import OrderedDict
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from overduetasks.analytics import (
@@ -16,9 +17,9 @@ from overduetasks.analytics import (
     build_overdue_breakdowns,
     build_overdue_breakdown_details,
     build_time_series_bundle,
+    create_timeline_figure,
     create_summary_gauge_figures,
     create_summary_indicators,
-    create_timeline_figure,
     create_visualizations,
     VisualizationBundle,
     create_wordcloud_figure,
@@ -26,17 +27,29 @@ from overduetasks.analytics import (
     generate_excel_report,
     generate_pdf_report,
     identify_outliers,
+    profile_dataframe,
     prepare_task_dataframe,
     summarize_tasks,
     train_due_date_model,
 )
+from overduetasks.analytics.style import DEFAULT_PALETTE
 
 try:
+    from reportlab.lib import colors
     from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
     from reportlab.pdfgen import canvas
 except ImportError:  # pragma: no cover - optional dependency
     canvas = None  # type: ignore[assignment]
     letter = None  # type: ignore[assignment]
+    colors = None  # type: ignore[assignment]
+    Table = None  # type: ignore[assignment]
+    TableStyle = None  # type: ignore[assignment]
+    Paragraph = None  # type: ignore[assignment]
+    SimpleDocTemplate = None  # type: ignore[assignment]
+    Spacer = None  # type: ignore[assignment]
+    getSampleStyleSheet = None  # type: ignore[assignment]
 
 
 def render_analysis_dashboard(raw_df: pd.DataFrame) -> None:
@@ -65,6 +78,7 @@ def render_analysis_dashboard(raw_df: pd.DataFrame) -> None:
     _render_evolution_section(prepared)
     _render_fleet_table(prepared)
     _render_additional_visuals(prepared)
+    _render_fleet_deferral_heatmap(prepared)
     _render_outlier_section(prepared)
     _render_model_section(prepared)
     _render_key_drivers(summary)
@@ -97,21 +111,21 @@ def _render_reporting_banner(summary: TaskAnalyticsSummary, prepared: pd.DataFra
 def _render_summary_section(prepared: pd.DataFrame, summary: TaskAnalyticsSummary) -> None:
     st.subheader("Summary")
 
-    indicators = create_summary_indicators(prepared, summary)
-    try:
-        gauge_figs = create_summary_gauge_figures(indicators)
-    except ImportError as exc:
-        st.warning(str(exc))
-        _render_metric_row(summary)
-    else:
-        cols = st.columns(len(gauge_figs))
-        for col, (label, figure) in zip(cols, gauge_figs.items()):
-            with col:
-                st.plotly_chart(figure, use_container_width=True, config={"displayModeBar": False})
-        st.caption("Gauge cards show the share of on-time, completed, high severity, and responsive tasks.")
-
     _render_metric_row(summary)
+    _render_summary_gauges(prepared, summary)
+    _render_snapshot_highlights(prepared, summary)
+
+    data_profile = profile_dataframe(prepared)
+    quality_notes = _build_data_quality_notes(data_profile)
+    if quality_notes:
+        st.markdown("**Data Quality Watchlist**")
+        for note in quality_notes:
+            st.markdown(f"- {note}")
+    else:
+        st.caption("No significant data quality anomalies detected in the current snapshot.")
+
     _render_fleet_overdue_share(prepared)
+    _render_summary_highlights(prepared, summary)
 
 
 def _render_time_series_section(bundle, error: str | None) -> None:
@@ -205,22 +219,16 @@ def _render_overdue_breakdowns(prepared: pd.DataFrame, summary: TaskAnalyticsSum
                     max_value=100,
                     format="%.1f%%",
                 ),
-                "Avg Days Overdue": st.column_config.NumberColumn(
-                    "Avg Days Overdue",
-                    format="%.1f",
-                    help="Mean overdue duration for tasks in this bucket.",
-                ),
-                "Median Days Overdue": st.column_config.NumberColumn("Median Days Overdue", format="%.1f"),
-                "Max Days Overdue": st.column_config.NumberColumn("Max Days Overdue", format="%.1f"),
-                "Avg Days Active": st.column_config.NumberColumn(
-                    "Avg Days Active",
-                    format="%.1f",
-                    help="Average days elapsed since the fault was first found.",
+                "Top Deferral Classes": st.column_config.TextColumn(
+                    "Top Deferral Classes",
+                    help="Most common deferral classes within the bucket (share of bucket).",
                 ),
             }
 
-            trimmed = table
-            if len(table) > 10:
+            augmented = _append_deferral_class_summary(table, label, breakdown_details.get(label, {}))
+
+            trimmed = augmented
+            if len(augmented) > 10:
                 show_full = st.toggle(
                     "Show full list",
                     value=False,
@@ -228,10 +236,10 @@ def _render_overdue_breakdowns(prepared: pd.DataFrame, summary: TaskAnalyticsSum
                     help="Toggle to reveal the complete table.",
                 )
                 if not show_full:
-                    trimmed = table.head(10)
-                    st.caption(f"Showing top {len(trimmed)} of {len(table)} groups by fault count.")
+                    trimmed = augmented.head(10)
+                    st.caption(f"Showing top {len(trimmed)} of {len(augmented)} groups by fault count.")
 
-            display_columns = [label, "Fault Count", "Fault Share %", "Avg Days Overdue", "Median Days Overdue", "Max Days Overdue", "Avg Days Active"]
+            display_columns = [label, "Fault Count", "Fault Share %", "Top Deferral Classes"]
             display_columns = [col for col in display_columns if col in trimmed.columns]
 
             with st.container():
@@ -241,11 +249,40 @@ def _render_overdue_breakdowns(prepared: pd.DataFrame, summary: TaskAnalyticsSum
                     hide_index=True,
                     column_config=column_config,
                 )
+            insight_text = _breakdown_insight(trimmed, label)
+            if insight_text:
+                st.caption(insight_text)
 
-            chart_data = trimmed[[label, "Fault Count"]].set_index(label)
-            st.bar_chart(chart_data, use_container_width=True)
+            selected_bucket = trimmed[label].iloc[0] if not trimmed.empty else None
+            if not trimmed.empty and len(trimmed) > 1:
+                selected_bucket = st.selectbox(
+                    f"Visualise deferral mix for {label.lower()}",
+                    trimmed[label].tolist(),
+                    index=0,
+                    key=f"{label}_deferral_viz",
+                )
 
-            excel_bytes = dataframe_to_excel_bytes(table, sheet_name=label)
+            charts = st.columns((3, 2, 2))
+
+            with charts[0]:
+                chart_fig = _build_breakdown_bar_chart(trimmed, label)
+                st.plotly_chart(chart_fig, use_container_width=True, config={"displayModeBar": False})
+
+            with charts[1]:
+                share_fig = _build_share_pie_chart(trimmed, label)
+                st.plotly_chart(share_fig, use_container_width=True, config={"displayModeBar": False})
+
+            with charts[2]:
+                mix = {}
+                if selected_bucket is not None and "_deferral_mix" in augmented.columns:
+                    row = augmented.loc[augmented[label] == selected_bucket]
+                    if not row.empty:
+                        mix = row.iloc[0].get("_deferral_mix", {}) or {}
+                deferral_fig = _build_deferral_pie_chart(mix, bucket=str(selected_bucket) if selected_bucket else label)
+                st.plotly_chart(deferral_fig, use_container_width=True, config={"displayModeBar": False})
+
+            excel_ready = augmented.drop(columns=["_deferral_mix"], errors="ignore")
+            excel_bytes = dataframe_to_excel_bytes(excel_ready, sheet_name=label)
             safe_name = str(label).lower().replace(" ", "_").replace("/", "_")
             st.download_button(
                 f"Download {label} Breakdown (.xlsx)",
@@ -255,6 +292,25 @@ def _render_overdue_breakdowns(prepared: pd.DataFrame, summary: TaskAnalyticsSum
                 use_container_width=True,
                 key=f"{label}_agg_download",
             )
+            if canvas is not None and SimpleDocTemplate is not None:
+                pdf_bytes = _breakdown_to_pdf_bytes(
+                    label=label,
+                    table=excel_ready[display_columns],
+                    insight=insight_text,
+                    share_table=trimmed[[label, "Fault Share %", "Fault Count"]] if "Fault Share %" in trimmed else None,
+                    mix=mix,
+                    selected_bucket=str(selected_bucket) if selected_bucket is not None else None,
+                )
+                st.download_button(
+                    f"Download {label} Breakdown (.pdf)",
+                    data=pdf_bytes,
+                    file_name=f"overdue_{safe_name}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key=f"{label}_agg_pdf_download",
+                )
+            elif canvas is None:
+                st.caption("Install reportlab to enable PDF exports for this breakdown.")
 
             buckets = breakdown_details.get(label, {})
             if buckets:
@@ -301,6 +357,213 @@ def _render_overdue_breakdowns(prepared: pd.DataFrame, summary: TaskAnalyticsSum
                             st.bar_chart(prefix_table.set_index("Config Prefix"), use_container_width=True)
 
     st.caption("Need a consolidated PDF? Use the Export section below to grab the full report, now enhanced with these breakdowns.")
+
+
+def _append_deferral_class_summary(
+    table: pd.DataFrame,
+    label: str,
+    detail_mapping: OrderedDict[str, pd.DataFrame] | dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Return a copy of ``table`` augmented with deferral class bullet summaries."""
+    if table.empty or label not in table.columns:
+        return table
+    if label.lower() == "deferral class":
+        return table
+
+    mapped = table.copy()
+    if not detail_mapping:
+        return mapped
+
+    mix_lookup: dict[str, dict[str, float]] = {}
+    text_lookup: dict[str, str] = {}
+
+    for bucket, detail_df in detail_mapping.items():
+        if detail_df.empty:
+            continue
+        summary_text, mix = _summarise_deferral_classes(detail_df)
+        key = str(bucket)
+        text_lookup[key] = summary_text
+        mix_lookup[key] = mix
+
+    if not text_lookup:
+        return mapped
+
+    mapped["_deferral_mix"] = (
+        mapped[label]
+        .astype("string")
+        .map(lambda value: mix_lookup.get(str(value), {}))
+    )
+
+    mapped["Top Deferral Classes"] = (
+        mapped[label]
+        .astype("string")
+        .map(lambda value: text_lookup.get(str(value), "—"))
+        .fillna("—")
+    )
+    return mapped
+
+
+def _summarise_deferral_classes(
+    detail_df: pd.DataFrame,
+    *,
+    max_items: int = 3,
+) -> tuple[str, dict[str, float]]:
+    """Summarise top deferral classes for a given bucket."""
+    for candidate in ("Deferral Class", "deferral_class"):
+        if candidate in detail_df.columns:
+            series = detail_df[candidate]
+            break
+    else:
+        return "—"
+
+    normalised = (
+        series.astype("string")
+        .str.strip()
+        .replace({"": "UNKNOWN", "<NA>": "UNKNOWN"})
+        .fillna("UNKNOWN")
+    )
+    counts = normalised.value_counts()
+    if counts.empty:
+        return "—", {}
+
+    total = counts.sum()
+    percentage = (counts / total * 100.0) if total else counts * 0.0
+    parts = []
+    for value, share in percentage.head(max_items).items():
+        parts.append(f"{value} ({share:.1f}%)")
+    if len(percentage) > max_items:
+        parts.append("…")
+    return ", ".join(parts), percentage.to_dict()
+
+
+def _breakdown_insight(table: pd.DataFrame, label: str) -> str | None:
+    if table.empty or "Fault Share %" not in table or label not in table.columns:
+        return None
+
+    top_row = table.iloc[0]
+    top_share = float(top_row.get("Fault Share %", 0.0))
+    top_count = int(top_row.get("Fault Count", 0))
+    top_label = str(top_row[label])
+
+    cumulative = table["Fault Share %"].cumsum()
+    coverage_idx = min(2, len(cumulative) - 1)
+    coverage = float(cumulative.iloc[coverage_idx]) if coverage_idx >= 0 else top_share
+
+    return (
+        f"{top_label} leads with {top_count:,} overdue tasks ({top_share:.1f}% share); "
+        f"top {coverage_idx + 1} buckets account for {coverage:.1f}% of volume."
+    )
+
+
+def _build_breakdown_bar_chart(table: pd.DataFrame, label: str):
+    if table.empty or label not in table.columns or "Fault Count" not in table.columns:
+        fig = go.Figure()
+        fig.update_layout(
+            margin=dict(t=20, b=40, l=40, r=40),
+            plot_bgcolor="#f8f9fa",
+            paper_bgcolor="white",
+            font=dict(color="#1c1f24", size=12),
+        )
+        return fig
+
+    fig = px.bar(
+        table,
+        x=label,
+        y="Fault Count",
+        text="Fault Count",
+    )
+    primary_colour = DEFAULT_PALETTE[1] if len(DEFAULT_PALETTE) > 1 else "#1c7293"
+    fig.update_traces(
+        marker_color=primary_colour,
+        marker_line_color="#1c1f24",
+        marker_line_width=0.6,
+        texttemplate="%{y:.0f}",
+        textposition="outside",
+    )
+    if "Fault Share %" in table.columns:
+        fig.update_traces(
+            customdata=table[["Fault Share %"]].to_numpy(),
+            hovertemplate=f"{label}: %{{x}}<br>Fault Count: %{{y:,}}<br>Fault Share: %{{customdata[0]:.1f}}%",
+        )
+    else:
+        fig.update_traces(
+            hovertemplate=f"{label}: %{{x}}<br>Fault Count: %{{y:,}}",
+            customdata=None,
+        )
+
+    fig.update_layout(
+        margin=dict(t=20, b=60, l=60, r=20),
+        plot_bgcolor="#f8f9fa",
+        paper_bgcolor="white",
+        font=dict(color="#1c1f24", size=12),
+        xaxis=dict(title=label, showline=False, showgrid=False, tickangle=-35),
+        yaxis=dict(title="Fault Count", gridcolor="#d0d5dd", zerolinecolor="#d0d5dd"),
+    )
+    fig.update_yaxes(range=[0, table["Fault Count"].max() * 1.1])
+    return fig
+
+
+def _build_share_pie_chart(table: pd.DataFrame, label: str):
+    if table.empty or "Fault Share %" not in table.columns:
+        return go.Figure()
+
+    pie_df = table[[label, "Fault Share %"]].dropna()
+    if pie_df.empty:
+        return go.Figure()
+
+    fig = px.pie(
+        pie_df,
+        names=label,
+        values="Fault Share %",
+        hole=0.35,
+        color_discrete_sequence=DEFAULT_PALETTE,
+    )
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    fig.update_layout(
+        title=f"{label} share",
+        margin=dict(t=20, b=20, l=20, r=20),
+        legend_title_text=label,
+        showlegend=True,
+        paper_bgcolor="white",
+        font=dict(color="#1c1f24", size=12),
+    )
+    return fig
+
+
+def _build_deferral_pie_chart(mix: dict[str, float], *, bucket: str) -> go.Figure:
+    if not mix:
+        fig = go.Figure()
+        fig.update_layout(
+            margin=dict(t=20, b=20, l=20, r=20),
+            paper_bgcolor="white",
+            annotations=[
+                dict(text="No deferral data", x=0.5, y=0.5, showarrow=False, font=dict(size=12, color="#6c757d"))
+            ],
+        )
+        return fig
+
+    mix_df = (
+        pd.DataFrame(mix.items(), columns=["Deferral Class", "Share"])
+        .sort_values("Share", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    fig = px.pie(
+        mix_df,
+        names="Deferral Class",
+        values="Share",
+        hole=0.35,
+        color_discrete_sequence=DEFAULT_PALETTE,
+    )
+    fig.update_traces(textinfo="percent+label")
+    fig.update_layout(
+        title=f"Deferral mix: {bucket}",
+        margin=dict(t=40, b=20, l=20, r=20),
+        legend_title_text="Deferral Class",
+        paper_bgcolor="white",
+        font=dict(color="#1c1f24", size=12),
+    )
+    return fig
 
 
 def _plot_frequency_tab(base_frame: pd.DataFrame, rolling_frame: pd.DataFrame, *, window_labels: tuple[int, int], title: str) -> None:
@@ -462,12 +725,112 @@ def _inject_breakdown_theme() -> None:
     st.session_state["_breakdown_theme_injected"] = True
 
 
+def _render_snapshot_highlights(prepared: pd.DataFrame, summary: TaskAnalyticsSummary) -> None:
+    if summary.total_tasks == 0:
+        st.info("No tasks captured for the current snapshot. Scrape the latest data to populate analytics.")
+        return
+
+    bullets: list[str] = []
+    total = summary.total_tasks
+    overdue = summary.overdue_tasks
+
+    on_time_pct = summary.on_time_rate * 100.0
+    completion_pct = summary.completion_rate * 100.0
+    response_pct = summary.response_rate * 100.0
+
+    headline = f"{total:,} tasks tracked with {overdue:,} overdue — on-time index at {on_time_pct:.1f}%."
+    if response_pct > 0:
+        headline += f" Response/acknowledgement progress stands at {response_pct:.1f}%."
+    bullets.append(headline)
+
+    runway_parts: list[str] = [f"Completion rate {completion_pct:.1f}%"]
+    if not pd.isna(summary.mean_days_until_due):
+        runway_parts.append(f"avg days until due {summary.mean_days_until_due:.1f}")
+    if summary.overdue_tasks and not pd.isna(summary.mean_days_overdue):
+        runway_parts.append(f"overdue aging {summary.mean_days_overdue:.1f} days")
+    bullets.append(", ".join(runway_parts) + ".")
+
+    if summary.high_severity_share > 0:
+        bullets.append(
+            f"High/critical severity work represents {summary.high_severity_share * 100:.1f}% of the active backlog."
+        )
+
+    status_dist = sorted(summary.status_distribution.items(), key=lambda item: item[1], reverse=True)[:3]
+    if status_dist:
+        status_text = ", ".join(f"{name} {share * 100:.1f}%" for name, share in status_dist)
+        bullets.append(f"Status mix concentration: {status_text}.")
+
+    st.markdown("**Snapshot Highlights**")
+    for text in bullets[:4]:
+        st.markdown(f"- {text}")
+
+
+def _build_data_quality_notes(profile) -> list[str]:
+    issues: list[str] = []
+    added: set[str] = set()
+
+    for column in profile.columns:
+        message = ""
+        if column.missing_pct >= 30.0:
+            message = f"{column.name} is missing {column.missing_pct:.1f}% of values."
+        elif column.semantic_type == "mixed":
+            message = f"{column.name} mixes data types (inferred as {column.inferred_dtype})."
+        elif profile.row_count > 0 and column.unique_count <= 1 and column.semantic_type not in {"identifier", "boolean"}:
+            message = f"{column.name} shows little variation — verify that the feed is up to date."
+
+        if message and message not in added:
+            issues.append(message)
+            added.add(message)
+
+        if len(issues) >= 4:
+            break
+
+    for warning in profile.warnings:
+        if warning and warning not in added:
+            issues.append(warning)
+            added.add(warning)
+        if len(issues) >= 4:
+            break
+
+    return issues[:4]
+
+
 def _render_metric_row(summary: TaskAnalyticsSummary) -> None:
-    cols = st.columns(4)
-    cols[0].metric("Total Tasks", f"{summary.total_tasks:,}")
-    cols[1].metric("Overdue Tasks", f"{summary.overdue_tasks:,}")
-    cols[2].metric("Completion Rate", f"{summary.completion_rate * 100:.1f}%")
-    cols[3].metric("Avg Days Overdue", f"{summary.mean_days_overdue:.1f}")
+    primary = st.columns(4)
+    primary[0].metric("Total Tasks", f"{summary.total_tasks:,}")
+    primary[1].metric("Overdue Tasks", f"{summary.overdue_tasks:,}")
+    primary[2].metric("On-Time Rate", f"{summary.on_time_rate * 100:.1f}%")
+    primary[3].metric("Completion Rate", f"{summary.completion_rate * 100:.1f}%")
+
+    secondary = st.columns(4)
+    secondary[0].metric("Response Progress", f"{summary.response_rate * 100:.1f}%")
+    secondary[1].metric("High Severity Share", f"{summary.high_severity_share * 100:.1f}%")
+    avg_overdue = "—" if pd.isna(summary.mean_days_overdue) else f"{summary.mean_days_overdue:.1f}"
+    avg_until = "—" if pd.isna(summary.mean_days_until_due) else f"{summary.mean_days_until_due:.1f}"
+    secondary[2].metric("Avg Days Overdue", avg_overdue)
+    secondary[3].metric("Avg Days Until Due", avg_until)
+
+
+def _render_summary_gauges(prepared: pd.DataFrame, summary: TaskAnalyticsSummary) -> None:
+    if summary.total_tasks <= 0:
+        return
+
+    try:
+        indicators = create_summary_indicators(prepared, summary)
+        figures = create_summary_gauge_figures(indicators)
+    except ImportError as exc:
+        st.info(str(exc))
+        return
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"Summary gauges unavailable: {exc}")
+        return
+
+    if not figures:
+        return
+
+    columns = st.columns(len(figures))
+    for column, figure in zip(columns, figures.values()):
+        column.plotly_chart(figure, use_container_width=True, config={"displayModeBar": False})
 
 
 def _render_fleet_overdue_share(prepared: pd.DataFrame) -> None:
@@ -575,6 +938,71 @@ def _render_fleet_overdue_share(prepared: pd.DataFrame) -> None:
             )
 
 
+def _render_summary_highlights(prepared: pd.DataFrame, summary: TaskAnalyticsSummary) -> None:
+    bullets: list[str] = []
+
+    fleet_share = build_fleet_overdue_share(prepared)
+    if not fleet_share.empty:
+        leader = fleet_share.iloc[0]
+        leader_text = (
+            f"{leader['Fleet']} carries {leader['Overdue Share %']:.1f}% of overdue tasks "
+            f"({leader['Overdue Tasks']:,} backlog items)."
+        )
+
+        if len(fleet_share) > 1:
+            runner_up = fleet_share.iloc[1]
+            spread = fleet_share["Overdue Share %"].head(3).sum()
+            leader_text += (
+                f" Next fleets: {runner_up['Fleet']} at {runner_up['Overdue Share %']:.1f}% and "
+                f"{spread:.1f}% of all overdues sit within the top three fleets."
+            )
+        bullets.append(leader_text)
+
+    overdue_df = prepared.loc[prepared.get("is_overdue", False)].copy()
+    if not overdue_df.empty:
+        mean_days = overdue_df["days_overdue"].mean()
+        median_days = overdue_df["days_overdue"].median()
+        p90_days = overdue_df["days_overdue"].quantile(0.9)
+        chronic = int((overdue_df["days_overdue"] >= 180).sum())
+        bullets.append(
+            f"Overdue aging averages {mean_days:,.0f} days (median {median_days:,.0f}, 90th percentile {p90_days:,.0f}); "
+            f"{chronic} tasks have been open for ≥180 days."
+        )
+
+    severity_counts = (
+        prepared["severity_display"]
+        .astype("string")
+        .replace({"": "UNKNOWN", "<NA>": "UNKNOWN"})
+        .str.upper()
+        .value_counts(normalize=True)
+        .head(3)
+    )
+    if not severity_counts.empty:
+        entries = [f"{name.title()} {share * 100:.1f}%" for name, share in severity_counts.items()]
+        bullets.append(f"Task severity mix is dominated by {', '.join(entries)}.")
+
+    if "deferral_class" in prepared.columns:
+        deferral_share = (
+            prepared["deferral_class"]
+            .astype("string")
+            .replace({"": "UNKNOWN", "<NA>": "UNKNOWN"})
+            .value_counts(normalize=True)
+            .head(3)
+        )
+        if not deferral_share.empty:
+            parts = [f"{name} {share * 100:.1f}%" for name, share in deferral_share.items()]
+            bullets.append(f"Top deferral classes: {', '.join(parts)}.")
+
+    if bullets:
+        st.markdown("**Insight Highlights**")
+        for text in bullets[:4]:
+            st.markdown(f"- {text}")
+        st.caption(
+            "Highlights use descriptive statistics (mean, median, quantiles) and concentration measures inspired by "
+            "modern analytics practices from pandas- and matplotlib-focused workflows."
+        )
+
+
 def _render_evolution_section(prepared: pd.DataFrame) -> None:
     st.subheader("Indexes Evolution")
     try:
@@ -619,6 +1047,167 @@ def _render_fleet_table(prepared: pd.DataFrame) -> None:
             ),
         },
     )
+
+
+def _render_fleet_deferral_heatmap(prepared: pd.DataFrame) -> None:
+    st.subheader("Fleet vs Deferral Class Heatmap")
+
+    required = {"fleet", "deferral_class"}
+    if prepared.empty or not required.issubset(prepared.columns):
+        st.caption("Fleet/deferral class data not available in this snapshot.")
+        return
+
+    base = prepared[list(required)].copy()
+    base["fleet"] = (
+        base["fleet"].astype("string").str.strip().replace({"": "UNKNOWN", "<NA>": "UNKNOWN"}).fillna("UNKNOWN")
+    )
+    base["deferral_class"] = (
+        base["deferral_class"].astype("string").str.strip().replace({"": "UNKNOWN", "<NA>": "UNKNOWN"}).fillna("UNKNOWN")
+    )
+
+    if base.empty:
+        st.caption("No fleet/deferral combinations found.")
+        return
+
+    counts = (
+        base.groupby(["fleet", "deferral_class"], dropna=False)
+        .size()
+        .reset_index(name="count")
+    )
+
+    if counts.empty:
+        st.caption("Insufficient combinations to render the heatmap.")
+        return
+
+    fleet_order = counts.groupby("fleet")["count"].sum().sort_values(ascending=False).index.tolist()
+    deferral_order = counts.groupby("deferral_class")["count"].sum().sort_values(ascending=False).index.tolist()
+
+    pivot = (
+        counts.pivot(index="fleet", columns="deferral_class", values="count")
+        .reindex(index=fleet_order, columns=deferral_order)
+        .fillna(0)
+    )
+
+    total = counts["count"].sum()
+    top_pairs = counts.sort_values("count", ascending=False).head(3)
+    if total and not top_pairs.empty:
+        top_share = top_pairs["count"].sum() / total * 100.0
+        highlights = ", ".join(
+            f"{row['fleet']}×{row['deferral_class']} ({int(row['count']):,})"
+            for _, row in top_pairs.iterrows()
+        )
+        st.caption(f"Top three fleet/deferral combos cover {top_share:.1f}% of backlog: {highlights}.")
+
+    matrix = pivot.to_numpy()
+    text_matrix = [[f"{val:.0f}" for val in row] for row in matrix]
+    max_value = matrix.max() if matrix.size else 0
+    threshold = max_value * 0.55 if max_value else 0
+
+    fig = px.imshow(
+        matrix,
+        x=pivot.columns,
+        y=pivot.index,
+        color_continuous_scale="YlGnBu",
+        aspect="auto",
+        origin="upper",
+    )
+    fig.update_layout(
+        title="Deferral pressure across fleets",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        font=dict(color="#1c1f24", size=12),
+        margin=dict(t=70, b=60, l=80, r=60),
+        coloraxis_colorbar=dict(title="Task Count"),
+    )
+    fig.update_xaxes(title="Deferral Class", side="top", tickangle=-40)
+    fig.update_yaxes(title="Fleet")
+    fig.update_traces(
+        text=text_matrix,
+        texttemplate="%{text}",
+        textfont=dict(color="#1c1f24", size=11),
+        hovertemplate="Fleet: %{y}<br>Deferral: %{x}<br>Tasks: %{z:.0f}<extra></extra>",
+    )
+
+    if matrix.size and threshold:
+        for y_index, fleet in enumerate(pivot.index):
+            for x_index, deferral in enumerate(pivot.columns):
+                value = matrix[y_index][x_index]
+                if value >= threshold:
+                    fig.add_annotation(
+                        x=deferral,
+                        y=fleet,
+                        text=f"{int(value)}",
+                        showarrow=False,
+                        font=dict(color="#f8f9fa", size=11, family="Helvetica-Bold"),
+                    )
+
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    export_frame = pivot.reset_index().rename(columns={"index": "Fleet"})
+    excel_bytes = dataframe_to_excel_bytes(export_frame, sheet_name="Fleet vs Deferral")
+    st.download_button(
+        "Download heatmap data (.xlsx)",
+        data=excel_bytes,
+        file_name="fleet_deferral_heatmap.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="fleet_deferral_heatmap_excel",
+    )
+
+    if SimpleDocTemplate is not None:
+        pdf_bytes = _table_to_pdf_bytes(
+            title="Fleet vs Deferral Class Heatmap",
+            subtitle="Cross-tabulation of task counts helping prioritise deferral relief by fleet.",
+            table=export_frame,
+        )
+        st.download_button(
+            "Download heatmap table (.pdf)",
+            data=pdf_bytes,
+            file_name="fleet_deferral_heatmap.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key="fleet_deferral_heatmap_pdf",
+        )
+
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+        import seaborn as sns  # type: ignore
+    except ImportError:
+        chart_pdf = None
+    else:
+        sns.set_theme(style="white", context="talk")
+        fig, ax = plt.subplots(
+            figsize=(max(6.0, pivot.shape[1] * 0.55), max(4.0, pivot.shape[0] * 0.6))
+        )
+        sns.heatmap(
+            pivot,
+            annot=True,
+            fmt=".0f",
+            cmap="YlGnBu",
+            cbar_kws={"label": "Task Count"},
+            linewidths=0.6,
+            linecolor="#e9ecef",
+            ax=ax,
+        )
+        ax.set_title("Deferral pressure across fleets", fontsize=16, fontweight="bold")
+        ax.set_xlabel("Deferral Class", fontsize=12)
+        ax.set_ylabel("Fleet", fontsize=12)
+        plt.setp(ax.get_xticklabels(), rotation=35, ha="right")
+        fig.tight_layout()
+        chart_pdf = _figure_to_pdf_bytes(fig)
+        plt.close(fig)
+
+    if chart_pdf:
+        st.download_button(
+            "Download heatmap chart (.pdf)",
+            data=chart_pdf,
+            file_name="fleet_deferral_heatmap_chart.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key="fleet_deferral_heatmap_chart_pdf",
+        )
+    elif chart_pdf is None:
+        st.caption("Install matplotlib and seaborn to export the heatmap graphic as PDF.")
 
 
 def _render_additional_visuals(prepared: pd.DataFrame) -> None:
@@ -781,6 +1370,67 @@ def _figure_to_pdf_bytes(figure) -> bytes:
     return buffer.getvalue()
 
 
+def _table_to_pdf_bytes(*, title: str, subtitle: str | None, table: pd.DataFrame) -> bytes:
+    if (
+        SimpleDocTemplate is None
+        or getSampleStyleSheet is None
+        or Table is None
+        or TableStyle is None
+        or colors is None
+        or letter is None
+    ):
+        raise ImportError("reportlab is required for PDF export.")
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, leftMargin=36, rightMargin=36, topMargin=48, bottomMargin=36)
+    styles = getSampleStyleSheet()
+    story = [Paragraph(title, styles["Title"])]
+    if subtitle:
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(subtitle, styles["Normal"]))
+        story.append(Spacer(1, 12))
+
+    table_obj = _dataframe_to_reportlab_table(table)
+    story.append(table_obj)
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _dataframe_to_reportlab_table(frame: pd.DataFrame) -> "Table":
+    prepared = frame.copy()
+    for column in prepared.columns:
+        series = prepared[column]
+        if series.dtype.kind in {"f", "i"}:
+            header = column.lower()
+            if "share" in header or "%" in header:
+                prepared[column] = series.map(lambda val: f"{float(val):.1f}%" if pd.notna(val) else "—")
+            elif any(keyword in header for keyword in ("count", "tasks")):
+                prepared[column] = series.map(lambda val: f"{int(val):,}" if pd.notna(val) else "—")
+            else:
+                prepared[column] = series.map(lambda val: f"{float(val):.1f}" if pd.notna(val) else "—")
+        else:
+            prepared[column] = series.fillna("—").astype(str)
+
+    data = [prepared.columns.tolist()] + prepared.values.tolist()
+    table_obj = Table(data, hAlign="LEFT")
+    header_colour = DEFAULT_PALETTE[1] if len(DEFAULT_PALETTE) > 1 else "#1c7293"
+    table_obj.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(header_colour)),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 10),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#f1f3f5")]),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#dee2e6")),
+            ]
+        )
+    )
+    return table_obj
+
+
 def _datasets_to_excel_bytes(
     datasets: "OrderedDict[str, pd.DataFrame]",
     *,
@@ -853,6 +1503,57 @@ def _chart_counts_from_bundle(bundle: VisualizationBundle, prepared: pd.DataFram
             break
 
     return max(total_tasks, 0), max(overdue_tasks, 0)
+
+
+def _breakdown_to_pdf_bytes(
+    *,
+    label: str,
+    table: pd.DataFrame,
+    insight: str | None,
+    share_table: pd.DataFrame | None,
+    mix: dict[str, float] | None,
+    selected_bucket: str | None,
+) -> bytes:
+    if (
+        SimpleDocTemplate is None
+        or getSampleStyleSheet is None
+        or Table is None
+        or TableStyle is None
+        or colors is None
+        or letter is None
+    ):
+        raise ImportError("reportlab is required for PDF export.")
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, leftMargin=36, rightMargin=36, topMargin=48, bottomMargin=36)
+    styles = getSampleStyleSheet()
+
+    story = [Paragraph(f"{label} Breakdown", styles["Title"]), Spacer(1, 8)]
+    if insight:
+        story.append(Paragraph(insight, styles["Normal"]))
+        story.append(Spacer(1, 10))
+
+    story.append(Paragraph("Top groups", styles["Heading3"]))
+    story.append(_dataframe_to_reportlab_table(table.head(10)))
+    story.append(Spacer(1, 12))
+
+    if share_table is not None and not share_table.empty:
+        story.append(Paragraph(f"{label} share snapshot", styles["Heading3"]))
+        share_snapshot = share_table.copy().head(8)
+        story.append(_dataframe_to_reportlab_table(share_snapshot))
+        story.append(Spacer(1, 12))
+
+    if mix:
+        story.append(Paragraph(f"Deferral mix for {selected_bucket or 'selection'}", styles["Heading3"]))
+        mix_df = (
+            pd.DataFrame(sorted(mix.items(), key=lambda item: item[1], reverse=True), columns=["Deferral", "Share"])
+            .assign(Share=lambda frame: frame["Share"].astype(float))
+        )
+        story.append(_dataframe_to_reportlab_table(mix_df.head(10)))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def _fleet_summary_to_pdf(fleet: str, row: pd.Series) -> bytes:
